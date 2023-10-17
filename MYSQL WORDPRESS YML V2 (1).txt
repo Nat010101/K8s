@@ -1,0 +1,260 @@
+1.	Create a clusterclear
+2.	Create an NFS server
+3.	Deploy NFS client on worker nodes
+4.	Create a MySQL manifest file and deploy it using NFS-based persistent volume
+5.	Create a WordPress manifest file and deploy it using host-path-based persistent volume
+
+
+1- done
+
+2- Create an NFS server
+
+sudo su
+mkdir -p /data
+ls -alrt /data/
+sudo apt install nfs-kernel-server
+sudo chown nobody:nogroup /data/
+sudo chmod 777 /data/
+
+Open the exports file in the /etc directory for permission to access the host server machine
+sudo vi /etc/exports
+Add the following code to the file:
+
+/data 	*(rw,sync,no_root_squash)
+
+Note: Exit the file and save the changes
+Use the exportfs command to export all shared folders you registered in the /etc/exports file after making the appropriate changes
+
+sudo exportfs -rv
+
+
+4.	Create a MySQL manifest file and deploy it using NFS-based persistent volume
+
+# Create MySQL PV
+vi pv_mysql_nfs.yml
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-nfs
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Recycle
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+  nfs:
+    path: /data
+    server: 10.0.0.15
+
+# Create MySQL PVC 
+vi pvc_mysql_nfs.yml
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: mysql-nfs
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 2Gi
+
+# Create MYSQL Service
+vi service_mysql.yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  labels:
+    app: mysql-wordpress
+spec:
+  ports:
+    - port: 3306
+  selector:
+    app: mysql-wordpress
+    product: mysql
+
+# Create Mysql Secret
+vi secret.yaml
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret-password
+type: kubernetes.io/basic-auth
+stringData:
+  username: root
+  password: bXlzcWxAVGVtcDEyMw==
+
+# Create MYSQL Pod deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  labels:
+    app: mysql-wordpress
+spec:
+  selector:
+    matchLabels:
+      app: mysql-wordpress
+      product: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql-wordpress
+        product: mysql
+    spec:
+      containers:
+      - image: mysql
+        name: mysql-container
+        env:
+        - name: MYSQL_DATABASE
+          value: wordpress
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret-password
+              key: password
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-nfs
+		  
+# Create WordPress PV and PVC
+vi wordpressvolume.yml
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: hostpath-pv
+  labels:
+    type: hostpath
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  persistentVolumeReclaimPolicy: Delete
+  hostPath:
+    type: DirectoryOrCreate
+    path: "/opt/wordpress"
+---
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: wordpress-hostpath
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 500Mi
+
+# Create service and pod deployment
+vi wordpress.yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  labels:
+    app: mysql-wordpress
+spec:
+  ports:
+    - port: 80
+  selector:
+    app: mysql-wordpress
+    tier: frontend
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  labels:
+    app: mysql-wordpress
+spec:
+  selector:
+    matchLabels:
+      app: mysql-wordpress
+      tier: frontend
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql-wordpress
+        tier: frontend
+    spec:
+      containers:
+      - image: wordpress
+        name: wordpress
+        env:
+        - name: WORDPRESS_DB_HOST
+          value: mysql
+        - name: WORDPRESS_DB_USER
+          value: root
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret-password
+              key: password
+        ports:
+        - containerPort: 80
+          name: wordpress
+        volumeMounts:
+        - name: wordpress-storage
+          mountPath: /var/www/html
+      volumes:
+      - name: wordpress-storage
+        persistentVolumeClaim:
+          claimName: wordpress-hostpath
+		  
+alias k=kubectl
+		  
+k get pod -n m2ins
+
+NAME                         READY   STATUS    RESTARTS   AGE
+mysql-5867c5579c-2zz78       1/1     Running   0          60m
+wordpress-57589b4799-5wlkw   1/1     Running   0          35m
+
+azureuser@master:~/mysql_wordpress$ k get svc -n m2ins
+NAME        TYPE        CLUSTER-IP       EXTERNAL-IP     PORT(S)        AGE
+mysql       ClusterIP   10.109.150.254   <none>          3306/TCP       66m
+wordpress   NodePort    10.110.230.81    52.188.194.10   80:31172/TCP   36m
+
+
+# Autoscaling wordpress replica set
+
+
+ 
+vi autoscaling.yml
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  creationTimestamp: null
+  name: wordpress
+spec:
+  maxReplicas: 5
+  minReplicas: 1
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: wordpress
+  targetCPUUtilizationPercentage: 70
+status:
+  currentReplicas: 0
+  desiredReplicas: 0
